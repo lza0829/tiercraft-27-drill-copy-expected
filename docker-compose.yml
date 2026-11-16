@@ -1,0 +1,19 @@
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "10500:10500"
+    volumes:
+      - tiercraft_data:/data
+      - ./fixtures:/fixtures:ro
+    environment:
+      DATA_DIR: /data
+      FIXTURES_DIR: /fixtures
+  frontend:
+    build: ./frontend
+    ports:
+      - "5500:80"
+    depends_on:
+      - backend
+volumes:
+  tiercraft_data:
