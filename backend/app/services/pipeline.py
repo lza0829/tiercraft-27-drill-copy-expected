@@ -256,7 +256,7 @@ def compare_layers(conn, domain_id: int) -> dict:
     return {
         "detail_map": detail_map,
         "summary_map": summary_map,
-        "diff_keys": [],
+        "diff_keys": diff_keys,
     }
 
 
@@ -452,6 +452,126 @@ def _recompute_run_row(conn, run_id: int) -> dict | None:
     return d
 
 
+def _write_recompute_proof(conn, run_id: int) -> dict:
+    """按数据库现值生成下钻重算证明：差异键数、重算键数、成功/失败与越界写回键数。
+
+    - 差异键数：差异清单快照里的键数（发起重算时的清单）。
+    - 重算键数 / 成功 / 失败：recompute_items 实际逐键结果。
+    - 越界写回键数：重算项中不在该差异清单内的键数；应恒为 0，用于证明只重写清单内键。
+    """
+    run = conn.execute(
+        "SELECT * FROM recompute_runs WHERE id=?", (run_id,)
+    ).fetchone()
+    if not run:
+        raise ValueError("重算任务不存在")
+    list_id = int(run["diff_list_id"])
+    report_id = int(run["report_id"])
+    diff_key_count = int(
+        conn.execute(
+            "SELECT COUNT(*) AS c FROM reconcile_diff_keys WHERE list_id=?", (list_id,)
+        ).fetchone()["c"]
+    )
+    item_counts = conn.execute(
+        """
+        SELECT COUNT(*) AS total,
+               COALESCE(SUM(CASE WHEN status='成功' THEN 1 ELSE 0 END), 0) AS ok,
+               COALESCE(SUM(CASE WHEN status='失败' THEN 1 ELSE 0 END), 0) AS bad
+        FROM recompute_items WHERE run_id=?
+        """,
+        (run_id,),
+    ).fetchone()
+    recomputed = int(item_counts["total"])
+    ok = int(item_counts["ok"])
+    bad = int(item_counts["bad"])
+    out_of_list = int(
+        conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM recompute_items i
+            WHERE i.run_id=? AND NOT EXISTS (
+              SELECT 1 FROM reconcile_diff_keys k
+              WHERE k.list_id=? AND k.biz_day=i.biz_day AND k.store_code=i.store_code
+            )
+            """,
+            (run_id, list_id),
+        ).fetchone()["c"]
+    )
+    complete = 1 if recomputed == diff_key_count and out_of_list == 0 else 0
+    status = "成功" if bad == 0 else ("失败" if ok == 0 else "部分失败")
+    conn.execute(
+        """
+        INSERT INTO recompute_proofs(
+          run_id, report_id, diff_list_id, domain_id,
+          diff_key_count, recomputed_key_count, success_key_count, failed_key_count,
+          out_of_list_key_count, complete, status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(run_id) DO UPDATE SET
+          diff_key_count=excluded.diff_key_count,
+          recomputed_key_count=excluded.recomputed_key_count,
+          success_key_count=excluded.success_key_count,
+          failed_key_count=excluded.failed_key_count,
+          out_of_list_key_count=excluded.out_of_list_key_count,
+          complete=excluded.complete,
+          status=excluded.status
+        """,
+        (
+            run_id,
+            report_id,
+            list_id,
+            int(run["domain_id"]),
+            diff_key_count,
+            recomputed,
+            ok,
+            bad,
+            out_of_list,
+            complete,
+            status,
+        ),
+    )
+    row = conn.execute(
+        "SELECT * FROM recompute_proofs WHERE run_id=?", (run_id,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def _proof_rows_for_report(conn, report_id: int) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM recompute_proofs WHERE report_id=? ORDER BY id DESC",
+        (report_id,),
+    ).fetchall()
+    return rows_to_dicts(rows)
+
+
+def list_recompute_proofs(report_id: int) -> list[dict]:
+    """按对账报告 id 只读下钻重算证明。"""
+    conn = connect()
+    try:
+        if not _report_row(conn, report_id):
+            raise ValueError("对账报告不存在")
+        return _proof_rows_for_report(conn, report_id)
+    finally:
+        conn.close()
+
+
+def get_recompute_proof(run_id: int) -> dict:
+    """按重算任务 id 只读下钻重算证明（含逐键明细）。"""
+    conn = connect()
+    try:
+        proof = conn.execute(
+            "SELECT * FROM recompute_proofs WHERE run_id=?", (run_id,)
+        ).fetchone()
+        if not proof:
+            raise ValueError("该重算任务没有下钻证明")
+        out = dict(proof)
+        run = conn.execute(
+            "SELECT * FROM recompute_runs WHERE id=?", (run_id,)
+        ).fetchone()
+        out["run"] = dict(run) if run else None
+        out["items"] = _recompute_item_rows(conn, run_id)
+        return out
+    finally:
+        conn.close()
+
+
 def list_recompute_runs(report_id: int) -> list[dict]:
     conn = connect()
     try:
@@ -500,6 +620,7 @@ def get_reconcile_report(report_id: int) -> dict:
         return {
             "report": report,
             "diff_list": diff_list,
+            "proofs": _proof_rows_for_report(conn, report_id),
             "current": current_reconcile_state(int(report["domain_id"])),
         }
     finally:
@@ -540,30 +661,11 @@ def recompute_from_report(report_id: int) -> dict:
     finally:
         conn.close()
 
-    conn = connect()
-    try:
-        conn.execute("DELETE FROM layer_summary WHERE domain_id=?", (domain_id,))
-        for key in keys:
-            conn.execute(
-                """
-                INSERT INTO layer_summary(
-                  domain_id, biz_day, store_code, amount_sum, qty_sum, line_count
-                ) VALUES (?, ?, ?, ?, 0, ?)
-                """,
-                (
-                    domain_id,
-                    key["biz_day"],
-                    key["store_code"],
-                    float(key["detail_amount"]),
-                    int(key["detail_line_count"]),
-                ),
-            )
-        conn.commit()
-    finally:
-        conn.close()
-    success = len(keys)
+    success = 0
     failed = 0
-    for key in []:
+    # 只遍历差异清单内的键；每个键由 _recompute_one_key 在独立事务中从明细重新聚合，
+    # 不读取报告/清单里的期望值，也不触碰清单外的键。
+    for key in keys:
         biz_day = key["biz_day"]
         store_code = key["store_code"]
         try:
@@ -643,10 +745,13 @@ def recompute_from_report(report_id: int) -> dict:
         )
         conn.commit()
         run = _recompute_run_row(conn, run_id)
+        proof = _write_recompute_proof(conn, run_id)
+        conn.commit()
     finally:
         conn.close()
     return {
         "run": run,
+        "proof": proof,
         "current": current_reconcile_state(domain_id),
     }
 

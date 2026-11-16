@@ -46,3 +46,21 @@ def recompute(report_id: int):
         return pipeline.recompute_from_report(report_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/reconcile/{report_id}/proofs")
+def list_proofs(report_id: int):
+    """只读：按下钻证明查看该对账报告各次按键重算的差异键数/重算键数/成败。"""
+    try:
+        return pipeline.list_recompute_proofs(report_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/recompute/{run_id}/proof")
+def get_proof(run_id: int):
+    """只读：按重算任务 id 下钻重算证明与逐键结果。"""
+    try:
+        return pipeline.get_recompute_proof(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc

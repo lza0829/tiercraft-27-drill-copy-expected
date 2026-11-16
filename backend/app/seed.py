@@ -151,9 +151,33 @@ CREATE TABLE IF NOT EXISTS recompute_items (
   FOREIGN KEY(diff_key_id) REFERENCES reconcile_diff_keys(id)
 );
 
+-- 下钻重算证明：每次按键重算结束时由数据库现算落一行，供按报告 id / 重算任务 id 只读下钻。
+-- 差异键数取差异清单计数；重算键数与成败取 recompute_items 实际逐键结果；
+-- 越界写回键数应为 0，用于证明只重写了清单内键。
+CREATE TABLE IF NOT EXISTS recompute_proofs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id INTEGER NOT NULL UNIQUE,
+  report_id INTEGER NOT NULL,
+  diff_list_id INTEGER NOT NULL,
+  domain_id INTEGER NOT NULL,
+  diff_key_count INTEGER NOT NULL,
+  recomputed_key_count INTEGER NOT NULL,
+  success_key_count INTEGER NOT NULL,
+  failed_key_count INTEGER NOT NULL,
+  out_of_list_key_count INTEGER NOT NULL DEFAULT 0,
+  complete INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY(run_id) REFERENCES recompute_runs(id),
+  FOREIGN KEY(report_id) REFERENCES reconcile_reports(id),
+  FOREIGN KEY(diff_list_id) REFERENCES reconcile_diff_lists(id),
+  FOREIGN KEY(domain_id) REFERENCES domains(id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_diff_keys_list ON reconcile_diff_keys(list_id);
 CREATE INDEX IF NOT EXISTS idx_recompute_runs_report ON recompute_runs(report_id);
 CREATE INDEX IF NOT EXISTS idx_recompute_items_run ON recompute_items(run_id);
+CREATE INDEX IF NOT EXISTS idx_recompute_proofs_report ON recompute_proofs(report_id);
 """
 
 

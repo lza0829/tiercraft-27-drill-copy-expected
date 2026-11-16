@@ -43,6 +43,7 @@ npm run dev
 - **按键重算入口**：`POST /api/reconcile/{报告id}/recompute` 与「分层任务」里的全量明细到汇总完全分开。`recompute_runs.diff_list_id` 外键挂差异清单，只处理清单内键。
 - **写回来源**：每个键都从 `layer_detail` 重新聚合后写回 `layer_summary`，不读取报告里的期望值。
 - **提交边界**：逐键独立事务。单键失败只回滚该键，其余已成功键保留；运行状态记「部分失败」，`recompute_items` 逐键列出成功/失败与前后值。
+- **下钻重算证明**：每次重算收尾写入 `recompute_proofs`（重算任务 / 报告 / 差异清单一对一关联），字段含差异键数、重算键数、成功与失败键数、越界写回键数、覆盖是否完整。只读接口：`GET /api/reconcile/{报告id}/proofs` 与 `GET /api/recompute/{重算任务id}/proof`。证明数值按数据库现值计算，与对账页展示同源，不抄报告期望值。
 - **同源**：差异清单、重算报告、汇总写回与当前对账状态都由 `compare_layers()` 派生；报告状态是生成时快照，页面另示按现场派生的当前状态。
 
 ## 界面约定

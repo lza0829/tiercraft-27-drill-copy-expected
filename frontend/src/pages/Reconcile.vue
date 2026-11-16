@@ -85,10 +85,19 @@ async function recompute() {
 
 const diffKeys = computed(() => active.value?.diff_list?.keys || [])
 const runs = computed(() => active.value?.diff_list?.recompute_runs || [])
+const proofs = computed(() => active.value?.proofs || [])
 const hasDiff = computed(() => diffKeys.value.length > 0)
 
 function runStatusClass(s) {
   return s === '成功' ? 'ok' : 'warn'
+}
+
+function proofComplete(p) {
+  return p.complete === 1 && p.out_of_list_key_count === 0
+}
+
+function proofFor(runId) {
+  return proofs.value.find((p) => p.run_id === runId)
 }
 </script>
 
@@ -231,6 +240,13 @@ function runStatusClass(s) {
             </span>
           </div>
           <p class="muted">{{ run.message }}</p>
+          <p v-if="proofFor(run.id)" class="muted">
+            下钻证明：差异键数 {{ proofFor(run.id).diff_key_count }} ·
+            重算键数 {{ proofFor(run.id).recomputed_key_count }} ·
+            成功 {{ proofFor(run.id).success_key_count }} / 失败 {{ proofFor(run.id).failed_key_count }} ·
+            越界写回键数 {{ proofFor(run.id).out_of_list_key_count }} ·
+            覆盖完整 {{ proofFor(run.id).complete === 1 ? '是' : '否' }}
+          </p>
           <table>
             <thead>
               <tr>
@@ -261,6 +277,35 @@ function runStatusClass(s) {
             </tbody>
           </table>
         </div>
+      </div>
+
+      <div class="panel" v-if="proofs.length">
+        <h3>下钻重算证明</h3>
+        <p class="muted">
+          每次按键重算结束时按数据库现值落一份证明：差异键数取自本报告差异清单，
+          重算键数与成败取自逐键结果；越界写回键数应恒为 0，证明只重写了清单内键。
+        </p>
+        <table>
+          <thead>
+            <tr>
+              <th>重算任务</th><th>关联差异清单</th><th>差异键数</th><th>重算键数</th>
+              <th>成功</th><th>失败</th><th>越界写回键数</th><th>覆盖完整</th><th>状态</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="p in proofs" :key="p.id">
+              <td>{{ p.run_id }}</td>
+              <td>{{ p.diff_list_id }}</td>
+              <td>{{ p.diff_key_count }}</td>
+              <td>{{ p.recomputed_key_count }}</td>
+              <td class="ok">{{ p.success_key_count }}</td>
+              <td :class="p.failed_key_count ? 'warn' : ''">{{ p.failed_key_count }}</td>
+              <td :class="p.out_of_list_key_count ? 'warn' : ''">{{ p.out_of_list_key_count }}</td>
+              <td :class="proofComplete(p) ? 'ok' : 'warn'">{{ proofComplete(p) ? '是' : '否' }}</td>
+              <td :class="runStatusClass(p.status)">{{ p.status }}</td>
+            </tr>
+          </tbody>
+        </table>
       </div>
 
       <div class="panel">

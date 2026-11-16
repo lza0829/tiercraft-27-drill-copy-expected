@@ -265,3 +265,96 @@ def test_key_misalignment_with_same_count_and_amount(env):
     assert ("2026-11-11", "S01") in after
     assert ("2026-11-11", "S77") not in after
     assert pipeline.current_reconcile_state(1)["status"] == "一致"
+
+
+def test_proof_materialized_and_read_only_by_report_or_run(env):
+    seed, pipeline = env
+    _full_pipeline(pipeline)
+    _corrupt_summary(pipeline)
+    created = pipeline.run_reconcile(1)
+    result = pipeline.recompute_from_report(created["report"]["id"])
+    run = result["run"]
+    proof = result["proof"]
+
+    # 证明字段来自现算：差异键数取清单、重算键数与成败取逐键结果
+    assert proof["diff_key_count"] == 3
+    assert proof["recomputed_key_count"] == 3
+    assert proof["success_key_count"] == 3
+    assert proof["failed_key_count"] == 0
+    assert proof["out_of_list_key_count"] == 0
+    assert proof["complete"] == 1
+    assert proof["status"] == "成功"
+
+    # 两条只读下钻路径都必须能重回同一份证明
+    by_report = pipeline.list_recompute_proofs(created["report"]["id"])
+    assert [p["run_id"] for p in by_report] == [run["id"]]
+    by_run = pipeline.get_recompute_proof(run["id"])
+    assert by_run["diff_key_count"] == 3
+    assert by_run["out_of_list_key_count"] == 0
+    assert [(i["biz_day"], i["store_code"]) for i in by_run["items"]] == [
+        (k["biz_day"], k["store_code"]) for k in created["diff_list"]["keys"]
+    ]
+
+    # 与对账报告详情内嵌的证明同源
+    loaded = pipeline.get_reconcile_report(created["report"]["id"])
+    assert loaded["proofs"][0]["run_id"] == run["id"]
+
+
+def test_proof_records_partial_failure(env, monkeypatch):
+    seed, pipeline = env
+    _full_pipeline(pipeline)
+    _corrupt_summary(pipeline)
+    created = pipeline.run_reconcile(1)
+
+    original = pipeline._recompute_one_key
+
+    def flaky(domain_id, biz_day, store_code):
+        if store_code == "S02":
+            raise RuntimeError("模拟写汇总失败")
+        return original(domain_id, biz_day, store_code)
+
+    monkeypatch.setattr(pipeline, "_recompute_one_key", flaky)
+    result = pipeline.recompute_from_report(created["report"]["id"])
+    proof = result["proof"]
+    assert proof["status"] == "部分失败"
+    assert proof["success_key_count"] == 2
+    assert proof["failed_key_count"] == 1
+    assert proof["recomputed_key_count"] == 3
+    # 失败键也进了清单内逐键记录，未发生越界写回
+    assert proof["out_of_list_key_count"] == 0
+    assert proof["complete"] == 1
+
+
+def test_proof_absent_before_recompute(env):
+    seed, pipeline = env
+    _full_pipeline(pipeline)
+    _corrupt_summary(pipeline)
+    created = pipeline.run_reconcile(1)
+    assert pipeline.list_recompute_proofs(created["report"]["id"]) == []
+    with pytest.raises(ValueError):
+        pipeline.get_recompute_proof(9999)
+
+
+def test_recompute_does_not_copy_snapshot_values_back(env):
+    """报告快照里的 summary_amount 与 detail_amount 都不能被当作写回来源。"""
+    seed, pipeline = env
+    _full_pipeline(pipeline)
+    _corrupt_summary(pipeline)
+    created = pipeline.run_reconcile(1)
+    # 篡改差异清单快照中的期望金额，写回必须不受影响
+    from app.db import connect
+
+    conn = connect()
+    try:
+        conn.execute(
+            "UPDATE reconcile_diff_keys SET detail_amount=1, summary_amount=2 WHERE list_id=?",
+            (created["diff_list"]["id"],),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    pipeline.recompute_from_report(created["report"]["id"])
+    by_key = {(r["biz_day"], r["store_code"]): r for r in pipeline.layer_rows("summary", 1)}
+    assert by_key[("2026-11-10", "S01")]["amount_sum"] == pytest.approx(206.5)
+    assert by_key[("2026-11-11", "S02")]["amount_sum"] == pytest.approx(40.0)
